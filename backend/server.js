@@ -1,10 +1,11 @@
 // 🌍 Load environment variables
-require("dotenv").config();
+import dotenv from "dotenv";
+import express from "express";
+import cors from "cors";
+import { aggregateFeeds } from "./feeds.js";
 
-const express = require("express");
-const http = require("http");
-const axios = require("axios");
-const cors = require("cors");
+dotenv.config();
+
 const { Server } = require("socket.io");
 const geoip = require("geoip-lite");
 const mongoose = require("mongoose");
