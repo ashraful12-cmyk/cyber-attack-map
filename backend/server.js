@@ -1,4 +1,3 @@
-// backend/server.js
 // 🌍 Load environment variables
 require("dotenv").config();
 
@@ -25,27 +24,32 @@ const checkJwt = jwt({
 });
 
 const aggregateFeeds = require("./services/threatFeeds");
-const rows = await aggregateFeeds();
-
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-
-app.use(helmet());
-app.use(rateLimit({ windowMs: 60 * 1000, max: 60 }));
-
-app.get("/metrics", (req, res) => {
-  res.set("Content-Type", "text/plain");
-  res.send(`# HELP attack_count Total attacks processed\nattack_count ${lastSuccessfulData.length}`);
-});
-
-
-// Mongoose model
 const Attack = require("./models/Attack");
 
 // --- Configuration ---
 const MONGO_URI = process.env.MONGO_URI || "";
 const ABUSEIPDB_KEY = process.env.ABUSEIPDB_KEY || "";
 const PORT = process.env.PORT || 4000;
+
+// --- Express Setup ---
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(helmet());
+app.use(rateLimit({ windowMs: 60 * 1000, max: 60 }));
+
+app.get("/", (req, res) => res.send("🚀 Cyber Attack Map backend is running!"));
+
+app.get("/api/secure", checkJwt, (req, res) => {
+  res.json({ message: "🔐 Secure data", user: req.auth });
+});
+
+app.get("/metrics", (req, res) => {
+  res.set("Content-Type", "text/plain");
+  res.send(`# HELP attack_count Total attacks processed\nattack_count ${lastSuccessfulData.length}`);
+});
 
 // --- MongoDB Connection ---
 if (!MONGO_URI) {
@@ -56,44 +60,6 @@ if (!MONGO_URI) {
     .then(() => console.log("✅ MongoDB connected"))
     .catch((err) => console.error("❌ MongoDB connection error:", err.message));
 }
-
-// --- Express Setup ---
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-app.get("/", (req, res) => res.send("🚀 Cyber Attack Map backend is running!"));
-
-app.get("/api/secure", checkJwt, (req, res) => {
-  res.json({ message: "🔐 Secure data", user: req.auth });
-});
-
-
-// REST endpoint: recent attacks
-app.get("/api/attacks", async (req, res) => {
-  try {
-    const limit = Math.min(200, parseInt(req.query.limit || "50", 10));
-
-    if (mongoose.connection.readyState !== 1) {
-      return res.json({ source: "simulated", data: [] });
-    }
-
-const checkRules = require("./alerts/rulesEngine");
-await checkRules(attacks, "global");
-
-
-    const docs = await Attack.find({})
-      .sort({ timestamp: -1 })
-      .limit(limit)
-      .lean()
-      .exec();
-
-    res.json({ source: "db", data: docs });
-  } catch (err) {
-    console.error("API /api/attacks error:", err.message);
-    res.status(500).json({ error: "server error" });
-  }
-});
 
 // --- HTTP & Socket.IO Setup ---
 const server = http.createServer(app);
@@ -217,11 +183,6 @@ function scheduleLoop() {
   }, fetchIntervalMs);
 }
 
-// Initial run
-fetchAndEmit()
-  .catch((err) => console.error("Initial fetch error:", err.message))
-  .finally(() => scheduleLoop());
-
 // --- Socket.IO Connections ---
 io.on("connection", async (socket) => {
   console.log(`🔌 Client connected: ${socket.id}`);
@@ -241,5 +202,19 @@ io.on("connection", async (socket) => {
   socket.on("disconnect", () => console.log(`🔌 Client disconnected: ${socket.id}`));
 });
 
-// --- Start Server ---
-server.listen(PORT, () => console.log(`✅ Backend running on http://localhost:${PORT}`));
+// --- Start Server inside async wrapper ---
+async function startServer() {
+  try {
+    const rows = await aggregateFeeds();
+    console.log("✅ Initial threat feeds loaded:", rows.length);
+
+    await fetchAndEmit();
+    scheduleLoop();
+
+    server.listen(PORT, () => console.log(`✅ Backend running on http://localhost:${PORT}`));
+  } catch (err) {
+    console.error("❌ Error starting server:", err.message);
+  }
+}
+
+startServer();
