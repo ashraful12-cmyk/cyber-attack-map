@@ -3,15 +3,18 @@ import dotenv from "dotenv";
 import express from "express";
 import cors from "cors";
 import { aggregateFeeds } from "./feeds.js";
+import { Server } from "socket.io";
+import geoip from "geoip-lite";
+import mongoose from "mongoose";
+import http from "http";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import axios from "axios";
+import Attack from "./models/Attack.js";
+import { expressjwt as jwt } from "express-jwt";
+import jwksRsa from "jwks-rsa";
 
 dotenv.config();
-
-const { Server } = require("socket.io");
-const geoip = require("geoip-lite");
-const mongoose = require("mongoose");
-
-const { expressjwt: jwt } = require("express-jwt");
-const jwksRsa = require("jwks-rsa");
 
 const checkJwt = jwt({
   secret: jwksRsa.expressJwtSecret({
@@ -23,11 +26,6 @@ const checkJwt = jwt({
   issuer: `https://YOUR_AUTH0_DOMAIN/`,
   algorithms: ["RS256"]
 });
-
-const aggregateFeeds = require("./services/threatFeeds");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const Attack = require("./models/Attack");
 
 // --- Configuration ---
 const MONGO_URI = process.env.MONGO_URI || "";
@@ -47,6 +45,7 @@ app.get("/api/secure", checkJwt, (req, res) => {
   res.json({ message: "🔐 Secure data", user: req.auth });
 });
 
+let lastSuccessfulData = [];
 app.get("/metrics", (req, res) => {
   res.set("Content-Type", "text/plain");
   res.send(`# HELP attack_count Total attacks processed\nattack_count ${lastSuccessfulData.length}`);
@@ -70,7 +69,6 @@ const io = new Server(server, { cors: { origin: "*" } });
 let fetchIntervalMs = 60 * 1000; // default 60s
 let backoffFactor = 1;
 const MAX_BACKOFF_FACTOR = 16;
-let lastSuccessfulData = [];
 let lastFetchTs = 0;
 
 // --- Helpers ---
@@ -218,4 +216,4 @@ async function startServer() {
   }
 }
 
-startServer();
+startServer(); 
