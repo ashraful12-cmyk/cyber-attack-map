@@ -31,6 +31,8 @@ if (MONGO_URI) {
     .connect(MONGO_URI)
     .then(() => console.log("✅ MongoDB connected"))
     .catch((err) => console.error("❌ MongoDB connection error:", err.message));
+} else {
+  console.warn("⚠️ No MONGO_URI found — skipping DB connection.");
 }
 
 const server = http.createServer(app);
@@ -39,14 +41,20 @@ const io = new Server(server, { cors: { origin: "*" } });
 function ipToLatLon(ipAddr) {
   const geo = geoip.lookup(ipAddr);
   if (geo?.ll) return { lat: geo.ll[0], lon: geo.ll[1] };
+  // fallback if geo lookup fails
   return { lat: Math.random() * 180 - 90, lon: Math.random() * 360 - 180 };
 }
 
 async function fetchAbuseIpDb() {
-  const res = await axios.get("https://api.abuseipdb.com/api/v2/blacklist", {
-    headers: { Key: ABUSEIPDB_KEY, Accept: "application/json" },
-  });
-  return res.data.data || [];
+  try {
+    const res = await axios.get("https://api.abuseipdb.com/api/v2/blacklist", {
+      headers: { Key: ABUSEIPDB_KEY, Accept: "application/json" },
+    });
+    return res.data.data || [];
+  } catch (err) {
+    console.error("❌ Error fetching AbuseIPDB:", err.message);
+    return [];
+  }
 }
 
 function buildAttacks(rows) {
@@ -67,14 +75,10 @@ function buildAttacks(rows) {
 }
 
 async function fetchAndEmit() {
-  try {
-    const rows = await fetchAbuseIpDb();
-    const attacks = buildAttacks(rows);
-    io.emit("attackData", attacks);
-    console.log(`✅ Emitted ${attacks.length} attacks`);
-  } catch (err) {
-    console.error("❌ API error:", err.message);
-  }
+  const rows = await fetchAbuseIpDb();
+  const attacks = buildAttacks(rows);
+  io.emit("attackData", attacks);
+  console.log(`✅ Emitted ${attacks.length} attacks`);
 }
 
 io.on("connection", (socket) => {
