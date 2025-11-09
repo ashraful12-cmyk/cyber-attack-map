@@ -8,77 +8,118 @@ const axios = require("axios");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const geoip = require("geoip-lite");
+const mongoose = require("mongoose");
 
-// 🧩 MongoDB setup
-const mongoose = require('mongoose');
-const Attack = require('./models/Attack'); // ensure backend/models/Attack.js exists
+const { expressjwt: jwt } = require("express-jwt");
+const jwksRsa = require("jwks-rsa");
 
-const MONGO_URI = process.env.MONGO_URI;
-if (!MONGO_URI) {
-  console.warn('⚠️ MONGO_URI not set in backend/.env — DB disabled (using fallback simulated data).');
-} else {
-  mongoose.connect(MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-  })
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err.message));
-}
+const checkJwt = jwt({
+  secret: jwksRsa.expressJwtSecret({
+    jwksUri: `https://YOUR_AUTH0_DOMAIN/.well-known/jwks.json`,
+    cache: true,
+    rateLimit: true
+  }),
+  audience: "YOUR_API_IDENTIFIER",
+  issuer: `https://YOUR_AUTH0_DOMAIN/`,
+  algorithms: ["RS256"]
+});
 
+const aggregateFeeds = require("./services/threatFeeds");
+const rows = await aggregateFeeds();
+
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+
+app.use(helmet());
+app.use(rateLimit({ windowMs: 60 * 1000, max: 60 }));
+
+app.get("/metrics", (req, res) => {
+  res.set("Content-Type", "text/plain");
+  res.send(`# HELP attack_count Total attacks processed\nattack_count ${lastSuccessfulData.length}`);
+});
+
+
+// Mongoose model
+const Attack = require("./models/Attack");
+
+// --- Configuration ---
+const MONGO_URI = process.env.MONGO_URI || "";
 const ABUSEIPDB_KEY = process.env.ABUSEIPDB_KEY || "";
 const PORT = process.env.PORT || 4000;
 
+// --- MongoDB Connection ---
+if (!MONGO_URI) {
+  console.warn("⚠️ MONGO_URI not set in backend/.env — DB disabled (using fallback simulated data).");
+} else {
+  mongoose
+    .connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+    .then(() => console.log("✅ MongoDB connected"))
+    .catch((err) => console.error("❌ MongoDB connection error:", err.message));
+}
+
+// --- Express Setup ---
 const app = express();
 app.use(cors());
+app.use(express.json());
+
 app.get("/", (req, res) => res.send("🚀 Cyber Attack Map backend is running!"));
 
-// ✅ REST endpoint to fetch recent events
-app.get('/api/attacks', async (req, res) => {
+app.get("/api/secure", checkJwt, (req, res) => {
+  res.json({ message: "🔐 Secure data", user: req.auth });
+});
+
+
+// REST endpoint: recent attacks
+app.get("/api/attacks", async (req, res) => {
   try {
-    const limit = Math.min(200, parseInt(req.query.limit || '50', 10));
+    const limit = Math.min(200, parseInt(req.query.limit || "50", 10));
+
     if (mongoose.connection.readyState !== 1) {
-      return res.json({ source: 'simulated', data: [] });
+      return res.json({ source: "simulated", data: [] });
     }
+
+const checkRules = require("./alerts/rulesEngine");
+await checkRules(attacks, "global");
+
+
     const docs = await Attack.find({})
       .sort({ timestamp: -1 })
       .limit(limit)
       .lean()
       .exec();
-    res.json({ source: 'db', data: docs });
+
+    res.json({ source: "db", data: docs });
   } catch (err) {
-    console.error('API /api/attacks error:', err.message);
-    res.status(500).json({ error: 'server error' });
+    console.error("API /api/attacks error:", err.message);
+    res.status(500).json({ error: "server error" });
   }
 });
 
+// --- HTTP & Socket.IO Setup ---
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// --- Backoff + caching config ---
-let fetchIntervalMs = 60 * 1000; // 60s default
+// --- Fetch Loop Configuration ---
+let fetchIntervalMs = 60 * 1000; // default 60s
 let backoffFactor = 1;
 const MAX_BACKOFF_FACTOR = 16;
 let lastSuccessfulData = [];
 let lastFetchTs = 0;
 
-// helper to map ip -> lat/lon (fallback to random)
+// --- Helpers ---
 function ipToLatLon(ipAddr) {
   try {
     const geo = geoip.lookup(ipAddr);
-    if (geo && geo.ll) return { lat: geo.ll[0], lon: geo.ll[1] };
-  } catch (e) {}
+    if (geo?.ll) return { lat: geo.ll[0], lon: geo.ll[1] };
+  } catch (_) {}
   return { lat: Math.random() * 180 - 90, lon: Math.random() * 360 - 180 };
 }
 
 async function fetchAbuseIpDb() {
-  if (!ABUSEIPDB_KEY)
-    throw new Error("AbuseIPDB key missing in backend/.env (ABUSEIPDB_KEY)");
+  if (!ABUSEIPDB_KEY) throw new Error("AbuseIPDB key missing in backend/.env (ABUSEIPDB_KEY)");
   const url = "https://api.abuseipdb.com/api/v2/blacklist";
   const res = await axios.get(url, {
-    headers: {
-      Key: ABUSEIPDB_KEY,
-      Accept: "application/json",
-    },
+    headers: { Key: ABUSEIPDB_KEY, Accept: "application/json" },
     timeout: 15000,
   });
   return res.data.data || [];
@@ -102,7 +143,7 @@ function buildAttacks(rows) {
 }
 
 function simulatedAttacks(count = 10) {
-  return new Array(count).fill(0).map((_, i) => ({
+  return Array.from({ length: count }, (_, i) => ({
     id: `sim-${Date.now()}-${i}`,
     ip: "0.0.0.0",
     country: "SIM",
@@ -114,61 +155,59 @@ function simulatedAttacks(count = 10) {
   }));
 }
 
+// --- Main Fetch + Emit Logic ---
 async function fetchAndEmit() {
   try {
-    console.log(
-      `🔁 Fetching AbuseIPDB (interval ${fetchIntervalMs / 1000}s, backoff x${backoffFactor})`
-    );
+    console.log(`🔁 Fetching AbuseIPDB (interval ${fetchIntervalMs / 1000}s, backoff x${backoffFactor})`);
     const rows = await fetchAbuseIpDb();
     const attacks = buildAttacks(rows);
 
+    // Cache & reset backoff
     lastSuccessfulData = attacks;
     lastFetchTs = Date.now();
     backoffFactor = 1;
     fetchIntervalMs = 60 * 1000;
 
-    // 💾 Save attacks to MongoDB if connected
+    // Save to MongoDB (non-blocking)
     if (mongoose.connection.readyState === 1) {
-      Attack.insertMany(attacks.map(a => ({
-        ip: a.ip, country: a.country, lat: a.lat, lon: a.lon,
-        confidence: a.confidence, source: a.source, timestamp: new Date()
-      })))
-      .then(() => console.log('💾 Saved attacks to MongoDB'))
-      .catch(err => console.warn('DB save error:', err.message));
+      Attack.insertMany(
+        attacks.map((a) => ({
+          ip: a.ip,
+          country: a.country,
+          lat: a.lat,
+          lon: a.lon,
+          confidence: a.confidence,
+          source: a.source,
+          timestamp: a.timestamp || new Date(),
+        }))
+      )
+        .then(() => console.log("💾 Saved attacks to MongoDB"))
+        .catch((err) => console.warn("⚠️ DB save error:", err.message));
     }
 
     io.emit("attackData", attacks);
-    console.log(`✅ Emitted ${attacks.length} attack rows (live).`);
+    console.log(`✅ Emitted ${attacks.length} attacks (live).`);
   } catch (err) {
     const status = err.response?.status;
-    console.error("API error:", status || "", err.message);
+    console.error("❌ API error:", status || "unknown", err.message);
 
     if (status === 429) {
-      backoffFactor = Math.min(MAX_BACKOFF_FACTOR, backoffFactor * 2 || 2);
+      backoffFactor = Math.min(MAX_BACKOFF_FACTOR, backoffFactor * 2);
       fetchIntervalMs = 60 * 1000 * backoffFactor;
-      console.warn(
-        `⚠️ 429 received. Increasing fetch interval to ${fetchIntervalMs / 1000}s (backoff x${backoffFactor}).`
-      );
-      if (lastSuccessfulData?.length) {
-        io.emit("attackData", lastSuccessfulData);
-      } else {
-        io.emit("attackData", simulatedAttacks(10));
-      }
+      console.warn(`⚠️ Rate limited (429). Backoff x${backoffFactor} → ${fetchIntervalMs / 1000}s.`);
+      io.emit("attackData", lastSuccessfulData.length ? lastSuccessfulData : simulatedAttacks(10));
     } else if (status === 401) {
-      console.error("❌ 401 Unauthorized — check ABUSEIPDB_KEY in backend/.env");
+      console.error("🔑 Invalid AbuseIPDB key — check ABUSEIPDB_KEY in backend/.env");
       io.emit("attackData", simulatedAttacks(10));
     } else {
-      if (lastSuccessfulData?.length) {
-        io.emit("attackData", lastSuccessfulData);
-      } else {
-        io.emit("attackData", simulatedAttacks(10));
-      }
       backoffFactor = Math.min(MAX_BACKOFF_FACTOR, backoffFactor + 1);
       fetchIntervalMs = 60 * 1000 * backoffFactor;
+      io.emit("attackData", lastSuccessfulData.length ? lastSuccessfulData : simulatedAttacks(10));
     }
   }
 }
 
+// --- Fetch Scheduler ---
 let fetchTimeout = null;
 function scheduleLoop() {
   if (fetchTimeout) clearTimeout(fetchTimeout);
@@ -178,25 +217,29 @@ function scheduleLoop() {
   }, fetchIntervalMs);
 }
 
+// Initial run
 fetchAndEmit()
   .catch((err) => console.error("Initial fetch error:", err.message))
   .finally(() => scheduleLoop());
 
-// ✅ Emit stored DB history to clients on connect
+// --- Socket.IO Connections ---
 io.on("connection", async (socket) => {
-  console.log("🔌 Client connected:", socket.id);
+  console.log(`🔌 Client connected: ${socket.id}`);
 
-  // If DB connected, send last N events to client otherwise fallback
   if (mongoose.connection.readyState === 1) {
-    const last = await Attack.find({}).sort({ timestamp: -1 }).limit(50).lean().exec();
-    socket.emit("attackData", last.reverse());
+    try {
+      const last = await Attack.find({}).sort({ timestamp: -1 }).limit(50).lean().exec();
+      socket.emit("attackData", last.reverse());
+    } catch (err) {
+      console.warn("⚠️ DB read error:", err.message);
+      socket.emit("attackData", simulatedAttacks(10));
+    }
   } else {
     socket.emit("attackData", simulatedAttacks(10));
   }
 
-  socket.on("disconnect", () => console.log("🔌 Client disconnected:", socket.id));
+  socket.on("disconnect", () => console.log(`🔌 Client disconnected: ${socket.id}`));
 });
 
-server.listen(PORT, () =>
-  console.log(`✅ Backend running on http://localhost:${PORT}`)
-);
+// --- Start Server ---
+server.listen(PORT, () => console.log(`✅ Backend running on http://localhost:${PORT}`));
