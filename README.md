@@ -195,3 +195,6 @@ Detection Engine: Custom SIEM-style rules
 📝 License
 MIT
 
+## 📊 Threat Hunting Dashboard Preview
+
+![Threat Hunting Dashboard](assets/dashboard.png)
